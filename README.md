@@ -2,7 +2,9 @@
 
 # RAVE: Realtime Audio Variational autoEncoder
 
-Official implementation of _RAVE: A variational autoencoder for fast and high-quality neural audio synthesis_ ([article link](https://arxiv.org/abs/2111.05011))
+Official implementation of _RAVE: A variational autoencoder for fast and high-quality neural audio synthesis_ ([article link](https://arxiv.org/abs/2111.05011)) by Antoine Caillon and Philippe Esling.
+
+If you use RAVE as a part of a music performance or installation, be sure to cite either this repository or the article !
 
 ## Installation
 
@@ -11,6 +13,12 @@ RAVE needs `python 3.9`. Install the dependencies using
 ```bash
 pip install -r requirements.txt
 ```
+
+Detailed instructions to setup a training station for this project are available [here](docs/training_setup.md).
+
+## Preprocessing
+
+RAVE comes with two command line utilities, `resample` and `duration`. `resample` allows to pre-process (silence removal, loudness normalization) and augment (compression) an entire directory of audio files (.mp3, .aiff, .opus, .wav, .aac). `duration` prints out the total duration of a .wav folder.
 
 ## Training
 
@@ -32,12 +40,47 @@ python reconstruct.py --ckpt /path/to/checkpoint --wav-folder /path/to/wav/folde
 
 You can also export RAVE to a `torchscript` file using `export_rave.py` and use the `encode` and `decode` methods on tensors.
 
-## MAX / MSP - PureData usage
+## Realtime usage
 
-**[NOT AVAILABLE YET]**
+**UPDATE**
 
-RAVE and the prior model can be used in realtime inside [max/msp](https://cycling74.com/), allowing creative interactions with both models. Code and details about this part of the project are not available yet, we are currently working on the corresponding article !
+If you want to use the realtime mode, you should update your dependencies !
+
+```bash
+pip install -r requirements.txt
+```
+
+RAVE and the prior model can be used in realtime on live audio streams, allowing creative interactions with both models.
+
+### [nn~](https://github.com/acids-ircam/nn_tilde)
+
+RAVE is compatible with the **nn~** max/msp and PureData external.
 
 ![max_msp_screenshot](docs/maxmsp_screenshot.png)
 
 An audio example of the prior sampling patch is available in the `docs/` folder.
+
+### [RAVE vst](https://github.com/acids-ircam/rave_vst)
+
+You can also use RAVE as a VST audio plugin using the RAVE vst !
+
+![plugin_screenshot](https://github.com/acids-ircam/rave_vst/blob/main/assets/rave_screenshot_audio_panel.png?raw=true)
+
+## Discussion
+
+If you have questions, want to share your experience with RAVE or share musical pieces done with the model, you can use the [Discussion tab](https://github.com/acids-ircam/RAVE/discussions) !
+
+## Demonstation
+
+### RAVE x nn~
+
+Demonstration of what you can do with RAVE and the nn~ external for maxmsp !
+
+[![RAVE x nn~](http://img.youtube.com/vi/dMZs04TzxUI/mqdefault.jpg)](https://www.youtube.com/watch?v=dMZs04TzxUI)
+
+### embedded RAVE
+
+Using nn~ for puredata, RAVE can be used in realtime on embedded platforms !
+
+
+[![RAVE x nn~](http://img.youtube.com/vi/jAIRf4nGgYI/mqdefault.jpg)](https://www.youtube.com/watch?v=jAIRf4nGgYI)

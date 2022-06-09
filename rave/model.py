@@ -4,20 +4,14 @@ import torch.nn.utils.weight_norm as wn
 import numpy as np
 import pytorch_lightning as pl
 from .core import multiscale_stft, Loudness, mod_sigmoid
-from .core import amp_to_impulse_response, fft_convolve
+from .core import amp_to_impulse_response, fft_convolve, get_beta_kl_cyclic_annealed
 from .pqmf import CachedPQMF as PQMF
 from sklearn.decomposition import PCA
 from einops import rearrange
 
-import math
-
 from time import time
 
-from cached_conv import USE_BUFFER_CONV, get_padding
-from cached_conv import CachedConv1d, CachedConvTranspose1d, Conv1d, CachedPadding1d, AlignBranches, CachedSequential
-
-Conv1d = CachedConv1d if USE_BUFFER_CONV else Conv1d
-ConvTranspose1d = CachedConvTranspose1d if USE_BUFFER_CONV else nn.ConvTranspose1d
+import cached_conv as cc
 
 
 class Profiler:
@@ -38,15 +32,15 @@ class Profiler:
 
 
 class Residual(nn.Module):
-    def __init__(self, module):
+    def __init__(self, module, cumulative_delay=0):
         super().__init__()
-        future = module.future_compensation
-        self.aligned = AlignBranches(
+        additional_delay = module.cumulative_delay
+        self.aligned = cc.AlignBranches(
             module,
             nn.Identity(),
-            futures=[future, 0],
+            delays=[additional_delay, 0],
         )
-        self.future_compensation = future
+        self.cumulative_delay = additional_delay + cumulative_delay
 
     def forward(self, x):
         x_net, x_res = self.aligned(x)
@@ -54,54 +48,73 @@ class Residual(nn.Module):
 
 
 class ResidualStack(nn.Module):
-    def __init__(self, dim, kernel_size, padding_mode, bias=False):
+    def __init__(self,
+                 dim,
+                 kernel_size,
+                 padding_mode,
+                 cumulative_delay=0,
+                 bias=False):
         super().__init__()
         net = []
+
+        res_cum_delay = 0
+        # SEQUENTIAL RESIDUALS
         for i in range(3):
-            net.append(
-                Residual(
-                    CachedSequential(
-                        nn.LeakyReLU(.2),
-                        wn(
-                            Conv1d(
-                                dim,
-                                dim,
-                                kernel_size,
-                                padding=get_padding(
-                                    kernel_size,
-                                    dilation=3**i,
-                                    mode=padding_mode,
-                                ),
-                                dilation=3**i,
-                                bias=bias,
-                            )),
-                        nn.LeakyReLU(.2),
-                        wn(
-                            Conv1d(
-                                dim,
-                                dim,
-                                kernel_size,
-                                padding=get_padding(kernel_size,
-                                                    mode=padding_mode),
-                                bias=bias,
-                            )),
+            # RESIDUAL BLOCK
+            seq = [nn.LeakyReLU(.2)]
+            seq.append(
+                wn(
+                    cc.Conv1d(
+                        dim,
+                        dim,
+                        kernel_size,
+                        padding=cc.get_padding(
+                            kernel_size,
+                            dilation=3**i,
+                            mode=padding_mode,
+                        ),
+                        dilation=3**i,
+                        bias=bias,
                     )))
 
-        self.net = CachedSequential(*net)
-        self.future_compensation = self.net.future_compensation
+            seq.append(nn.LeakyReLU(.2))
+            seq.append(
+                wn(
+                    cc.Conv1d(
+                        dim,
+                        dim,
+                        kernel_size,
+                        padding=cc.get_padding(kernel_size, mode=padding_mode),
+                        bias=bias,
+                        cumulative_delay=seq[-2].cumulative_delay,
+                    )))
+
+            res_net = cc.CachedSequential(*seq)
+
+            net.append(Residual(res_net, cumulative_delay=res_cum_delay))
+            res_cum_delay = net[-1].cumulative_delay
+
+        self.net = cc.CachedSequential(*net)
+        self.cumulative_delay = self.net.cumulative_delay + cumulative_delay
 
     def forward(self, x):
         return self.net(x)
 
 
 class UpsampleLayer(nn.Module):
-    def __init__(self, in_dim, out_dim, ratio, padding_mode, bias=False):
+    def __init__(self,
+                 in_dim,
+                 out_dim,
+                 ratio,
+                 padding_mode,
+                 cumulative_delay=0,
+                 bias=False):
         super().__init__()
         net = [nn.LeakyReLU(.2)]
         if ratio > 1:
             net.append(
                 wn(
-                    ConvTranspose1d(
+                    cc.ConvTranspose1d(
                         in_dim,
                         out_dim,
                         2 * ratio,
@@ -112,16 +125,16 @@ class UpsampleLayer(nn.Module):
         else:
             net.append(
                 wn(
-                    Conv1d(
+                    cc.Conv1d(
                         in_dim,
                         out_dim,
                         3,
-                        padding=get_padding(3, mode=padding_mode),
+                        padding=cc.get_padding(3, mode=padding_mode),
                         bias=bias,
                     )))
 
-        self.net = CachedSequential(*net)
-        self.future_compensation = self.net.future_compensation
+        self.net = cc.CachedSequential(*net)
+        self.cumulative_delay = self.net.cumulative_delay + cumulative_delay * ratio
 
     def forward(self, x):
         return self.net(x)
@@ -132,21 +145,25 @@ class NoiseGenerator(nn.Module):
         super().__init__()
         net = []
         channels = [in_size] * len(ratios) + [data_size * noise_bands]
+        cum_delay = 0
         for i, r in enumerate(ratios):
             net.append(
-                Conv1d(
+                cc.Conv1d(
                     channels[i],
                     channels[i + 1],
                     3,
-                    padding=get_padding(3, r, mode=padding_mode),
+                    padding=cc.get_padding(3, r, mode=padding_mode),
                     stride=r,
+                    cumulative_delay=cum_delay,
                 ))
+            cum_delay = net[-1].cumulative_delay
             if i != len(ratios) - 1:
                 net.append(nn.LeakyReLU(.2))
 
-        self.net = CachedSequential(*net)
+        self.net = cc.CachedSequential(*net)
         self.data_size = data_size
-        self.future_compensation = self.net.future_compensation
+        self.cumulative_delay = self.net.cumulative_delay * int(
+            np.prod(ratios))
 
         self.register_buffer(
             "target_size",
@@ -181,39 +198,57 @@ class Generator(nn.Module):
         super().__init__()
         net = [
             wn(
-                Conv1d(
+                cc.Conv1d(
                     latent_size,
                     2**len(ratios) * capacity,
                     7,
-                    padding=get_padding(7, mode=padding_mode),
+                    padding=cc.get_padding(7, mode=padding_mode),
                     bias=bias,
                 ))
         ]
+
         for i, r in enumerate(ratios):
             in_dim = 2**(len(ratios) - i) * capacity
             out_dim = 2**(len(ratios) - i - 1) * capacity
 
-            net.append(UpsampleLayer(in_dim, out_dim, r, padding_mode))
-            net.append(ResidualStack(out_dim, 3, padding_mode))
+            net.append(
+                UpsampleLayer(
+                    in_dim,
+                    out_dim,
+                    r,
+                    padding_mode,
+                    cumulative_delay=net[-1].cumulative_delay,
+                ))
+            net.append(
+                ResidualStack(
+                    out_dim,
+                    3,
+                    padding_mode,
+                    cumulative_delay=net[-1].cumulative_delay,
+                ))
 
-        self.net = CachedSequential(*net)
+        self.net = cc.CachedSequential(*net)
 
         wave_gen = wn(
-            Conv1d(out_dim,
-                   data_size,
-                   7,
-                   padding=get_padding(7, mode=padding_mode),
-                   bias=bias))
+            cc.Conv1d(
+                out_dim,
+                data_size,
+                7,
+                padding=cc.get_padding(7, mode=padding_mode),
+                bias=bias,
+            ))
 
         loud_gen = wn(
-            Conv1d(out_dim,
-                   1,
-                   2 * loud_stride + 1,
-                   stride=loud_stride,
-                   padding=get_padding(2 * loud_stride + 1,
+            cc.Conv1d(
+                out_dim,
+                1,
+                2 * loud_stride + 1,
+                stride=loud_stride,
+                padding=cc.get_padding(2 * loud_stride + 1,
                                        loud_stride,
                                        mode=padding_mode),
-                   bias=bias))
+                bias=bias,
+            ))
 
         branches = [wave_gen, loud_gen]
 
@@ -227,9 +262,14 @@ class Generator(nn.Module):
             )
             branches.append(noise_gen)
 
-        self.synth = AlignBranches(*branches)
+        self.synth = cc.AlignBranches(
+            *branches,
+            cumulative_delay=self.net.cumulative_delay,
+        )
+
         self.use_noise = use_noise
         self.loud_stride = loud_stride
+        self.cumulative_delay = self.synth.cumulative_delay
 
     def forward(self, x, add_noise: bool = True):
         x = self.net(x)
@@ -261,11 +301,11 @@ class Encoder(nn.Module):
                  bias=False):
         super().__init__()
         net = [
-            Conv1d(data_size,
-                   capacity,
-                   7,
-                   padding=get_padding(7, mode=padding_mode),
-                   bias=bias)
+            cc.Conv1d(data_size,
+                      capacity,
+                      7,
+                      padding=cc.get_padding(7, mode=padding_mode),
+                      bias=bias)
         ]
 
         for i, r in enumerate(ratios):
@@ -275,28 +315,30 @@ class Encoder(nn.Module):
             net.append(nn.BatchNorm1d(in_dim))
             net.append(nn.LeakyReLU(.2))
             net.append(
-                Conv1d(
+                cc.Conv1d(
                     in_dim,
                     out_dim,
                     2 * r + 1,
-                    padding=get_padding(2 * r + 1, r, mode=padding_mode),
+                    padding=cc.get_padding(2 * r + 1, r, mode=padding_mode),
                     stride=r,
                     bias=bias,
+                    cumulative_delay=net[-3].cumulative_delay,
                 ))
 
         net.append(nn.LeakyReLU(.2))
         net.append(
-            Conv1d(
+            cc.Conv1d(
                 out_dim,
                 2 * latent_size,
                 5,
-                padding=get_padding(5, mode=padding_mode),
+                padding=cc.get_padding(5, mode=padding_mode),
                 groups=2,
                 bias=bias,
+                cumulative_delay=net[-2].cumulative_delay,
             ))
 
-        self.net = CachedSequential(*net)
-        self.future_compensation = self.net.future_compensation
+        self.net = cc.CachedSequential(*net)
+        self.cumulative_delay = self.net.cumulative_delay
 
     def forward(self, x):
         z = self.net(x)
@@ -307,37 +349,42 @@ class Discriminator(nn.Module):
     def __init__(self, in_size, capacity, multiplier, n_layers):
         super().__init__()
 
-        net = [nn.Conv1d(in_size, capacity, 15, padding=7)]
+        net = [
+            wn(cc.Conv1d(in_size, capacity, 15, padding=cc.get_padding(15)))
+        ]
         net.append(nn.LeakyReLU(.2))
 
         for i in range(n_layers):
             net.append(
-                Conv1d(
-                    capacity * multiplier**i,
-                    min(1024, capacity * multiplier**(i + 1)),
-                    41,
-                    stride=multiplier,
-                    padding=get_padding(41, multiplier),
-                    groups=multiplier**(i + 1),
-                ))
+                wn(
+                    cc.Conv1d(
+                        capacity * multiplier**i,
+                        min(1024, capacity * multiplier**(i + 1)),
+                        41,
+                        stride=multiplier,
+                        padding=cc.get_padding(41, multiplier),
+                        groups=multiplier**(i + 1),
+                    )))
             net.append(nn.LeakyReLU(.2))
 
         net.append(
-            Conv1d(
-                min(1024, capacity * multiplier**(i + 1)),
-                min(1024, capacity * multiplier**(i + 1)),
-                5,
-                padding=get_padding(5),
-            ))
+            wn(
+                cc.Conv1d(
+                    min(1024, capacity * multiplier**(i + 1)),
+                    min(1024, capacity * multiplier**(i + 1)),
+                    5,
+                    padding=cc.get_padding(5),
+                )))
         net.append(nn.LeakyReLU(.2))
-        net.append(Conv1d(min(1024, capacity * multiplier**(i + 1)), 1, 1))
+        net.append(
+            wn(cc.Conv1d(min(1024, capacity * multiplier**(i + 1)), 1, 1)))
         self.net = nn.ModuleList(net)
 
     def forward(self, x):
         feature = []
         for layer in self.net:
             x = layer(x)
-            if isinstance(layer, Conv1d):
+            if isinstance(layer, nn.Conv1d):
                 feature.append(x)
         return feature
 
@@ -373,6 +420,10 @@ class RAVE(pl.LightningModule):
                  warmup,
                  mode,
                  no_latency=False,
+                 min_kl=1e-4,
+                 max_kl=5e-1,
+                 cropped_latent_size=0,
+                 feature_match=True,
                  sr=24000):
         super().__init__()
         self.save_hyperparameters()
@@ -380,16 +431,32 @@ class RAVE(pl.LightningModule):
         if data_size == 1:
             self.pqmf = None
         else:
-            self.pqmf = PQMF(40 if no_latency else 100, data_size)
+            self.pqmf = PQMF(70 if no_latency else 100, data_size)
 
         self.loudness = Loudness(sr, 512)
 
-        self.encoder = Encoder(data_size, capacity, latent_size, ratios,
-                               "causal" if no_latency else "centered", bias)
-        self.decoder = Generator(latent_size, capacity, data_size, ratios,
-                                 loud_stride, use_noise, noise_ratios,
-                                 noise_bands,
-                                 "causal" if no_latency else "centered", bias)
+        encoder_out_size = cropped_latent_size if cropped_latent_size else latent_size
+
+        self.encoder = Encoder(
+            data_size,
+            capacity,
+            encoder_out_size,
+            ratios,
+            "causal" if no_latency else "centered",
+            bias,
+        )
+        self.decoder = Generator(
+            latent_size,
+            capacity,
+            data_size,
+            ratios,
+            loud_stride,
+            use_noise,
+            noise_ratios,
+            noise_bands,
+            "causal" if no_latency else "centered",
+            bias,
+        )
 
         self.discriminator = StackDiscriminators(
             3,
@@ -401,9 +468,9 @@ class RAVE(pl.LightningModule):
 
         self.idx = 0
 
-        self.register_buffer("latent_pca", torch.eye(latent_size))
-        self.register_buffer("latent_mean", torch.zeros(latent_size))
-        self.register_buffer("fidelity", torch.zeros(latent_size))
+        self.register_buffer("latent_pca", torch.eye(encoder_out_size))
+        self.register_buffer("latent_mean", torch.zeros(encoder_out_size))
+        self.register_buffer("fidelity", torch.zeros(encoder_out_size))
 
         self.latent_size = latent_size
 
@@ -413,7 +480,14 @@ class RAVE(pl.LightningModule):
         self.warmed_up = False
         self.sr = sr
         self.mode = mode
-        self.step = 0
+
+        self.min_kl = min_kl
+        self.max_kl = max_kl
+        self.cropped_latent_size = cropped_latent_size
+
+        self.feature_match = feature_match
+
+        self.register_buffer("saved_step", torch.tensor(0))
 
     def configure_optimizers(self):
         gen_p = list(self.encoder.parameters())
@@ -447,8 +521,16 @@ class RAVE(pl.LightningModule):
         logvar = torch.log(var)
 
         z = torch.randn_like(mean) * std + mean
+
         kl = (mean * mean + var - logvar - 1).sum(1).mean()
 
+        if self.cropped_latent_size:
+            noise = torch.randn(
+                z.shape[0],
+                self.latent_size - self.cropped_latent_size,
+                z.shape[-1],
+            ).to(z.device)
+            z = torch.cat([z, noise], 1)
         return z, kl
 
     def adversarial_combine(self, score_real, score_fake, mode="hinge"):
@@ -460,14 +542,19 @@ class RAVE(pl.LightningModule):
             loss_dis = (score_real - 1).pow(2) + score_fake.pow(2)
             loss_dis = loss_dis.mean()
             loss_gen = (score_fake - 1).pow(2).mean()
+        elif mode == "nonsaturating":
+            score_real = torch.clamp(torch.sigmoid(score_real), 1e-7, 1 - 1e-7)
+            score_fake = torch.clamp(torch.sigmoid(score_fake), 1e-7, 1 - 1e-7)
+            loss_dis = -(torch.log(score_real) +
+                         torch.log(1 - score_fake)).mean()
+            loss_gen = -torch.log(score_fake).mean()
         else:
             raise NotImplementedError
         return loss_dis, loss_gen
 
     def training_step(self, batch, batch_idx):
         p = Profiler()
-        step = len(self.train_dataloader()) * self.current_epoch + batch_idx
-        self.step = step
+        self.saved_step += 1
 
         gen_opt, dis_opt = self.optimizers()
         x = batch.unsqueeze(1)
@@ -507,7 +594,7 @@ class RAVE(pl.LightningModule):
         distance = distance + loud_dist
         p.tick("loudness distance")
 
-        feature_matching_distance = 0
+        feature_matching_distance = 0.
         if self.warmed_up:  # DISCRIMINATION
             feature_true = self.discriminator(x)
             feature_fake = self.discriminator(y)
@@ -545,11 +632,20 @@ class RAVE(pl.LightningModule):
             loss_adv = torch.tensor(0.).to(x)
 
         # COMPOSE GEN LOSS
-        loss_gen = distance + feature_matching_distance + loss_adv + 1e-1 * kl
+        beta = get_beta_kl_cyclic_annealed(
+            step=self.global_step,
+            cycle_size=5e4,
+            warmup=self.warmup // 2,
+            min_beta=self.min_kl,
+            max_beta=self.max_kl,
+        )
+        loss_gen = distance + loss_adv + beta * kl
+        if self.feature_match:
+            loss_gen = loss_gen + feature_matching_distance
         p.tick("gen loss compose")
 
         # OPTIMIZATION
-        if step % 2 and self.warmed_up:
+        if self.global_step % 2 and self.warmed_up:
             dis_opt.zero_grad()
             loss_dis.backward()
             dis_opt.step()
@@ -567,6 +663,7 @@ class RAVE(pl.LightningModule):
         self.log("pred_true", pred_true.mean())
         self.log("pred_fake", pred_fake.mean())
         self.log("distance", distance)
+        self.log("beta", beta)
         self.log("feature_matching", feature_matching_distance)
         p.tick("log")
 
@@ -610,6 +707,9 @@ class RAVE(pl.LightningModule):
     def validation_epoch_end(self, out):
         audio, z = list(zip(*out))
 
+        if self.saved_step > self.warmup:
+            self.warmed_up = True
+
         # LATENT SPACE ANALYSIS
         if not self.warmed_up:
             z = torch.cat(z, 0)
@@ -618,7 +718,7 @@ class RAVE(pl.LightningModule):
             self.latent_mean.copy_(z.mean(0))
             z = z - self.latent_mean
 
-            pca = PCA(self.latent_size).fit(z.cpu().numpy())
+            pca = PCA(z.shape[-1]).fit(z.cpu().numpy())
 
             components = pca.components_
             components = torch.from_numpy(components).to(z)
@@ -631,11 +731,10 @@ class RAVE(pl.LightningModule):
 
             var_percent = [.8, .9, .95, .99]
             for p in var_percent:
-                self.log(f"{p}%_manifold", np.argmax(var > p))
-
-        if self.step > self.warmup:
-            self.warmed_up = True
+                self.log(f"{p}%_manifold",
+                         np.argmax(var > p).astype(np.float32))
 
         y = torch.cat(audio, 0)[:64].reshape(-1)
-        self.logger.experiment.add_audio("audio_val", y, self.idx, self.sr)
+        self.logger.experiment.add_audio("audio_val", y,
+                                         self.saved_step.item(), self.sr)
         self.idx += 1

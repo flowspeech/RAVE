@@ -7,9 +7,7 @@ from random import random
 from scipy.signal import lfilter
 from pytorch_lightning.callbacks import ModelCheckpoint
 import librosa as li
-import math
-from os import path
-from glob import glob
+from pathlib import Path
 
 
 def mod_sigmoid(x):
@@ -68,6 +66,7 @@ def random_phase_mangle(x, min_f, max_f, amp, sr):
 
 
 class EMAModelCheckPoint(ModelCheckpoint):
+
     def __init__(self, model: torch.nn.Module, alpha=.999, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -105,13 +104,14 @@ class EMAModelCheckPoint(ModelCheckpoint):
 
 
 class Loudness(nn.Module):
+
     def __init__(self, sr, block_size, n_fft=2048):
         super().__init__()
         self.sr = sr
         self.block_size = block_size
         self.n_fft = n_fft
 
-        f = li.fft_frequencies(sr, n_fft) + 1e-7
+        f = np.linspace(0, sr / 2, n_fft // 2 + 1) + 1e-7
         a_weight = li.A_weighting(f).reshape(-1, 1)
 
         self.register_buffer("a_weight", torch.from_numpy(a_weight).float())
@@ -168,22 +168,29 @@ def fft_convolve(signal, kernel):
     return output
 
 
-def search_for_run(run_path):
-    if ".ckpt" in run_path:
-        pass
-    elif "checkpoints" in run_path:
-        run_path = path.join(run_path, "*.ckpt")
-        run_path = glob(run_path)
-        run_path = list(filter(lambda e: "last" in e, run_path))[-1]
-    elif "version" in run_path:
-        run_path = path.join(run_path, "checkpoints", "*.ckpt")
-        run_path = glob(run_path)
-        run_path = list(filter(lambda e: "last" in e, run_path))[-1]
-    else:
-        run_path = glob(path.join(run_path, "*"))
-        run_path.sort()
-        run_path = run_path[-1]
-        run_path = path.join(run_path, "checkpoints", "*.ckpt")
-        run_path = glob(run_path)
-        run_path = list(filter(lambda e: "last" in e, run_path))[-1]
-    return run_path
+def search_for_run(run_path, mode="last"):
+    if run_path is None: return None
+    if ".ckpt" in run_path: return run_path
+    ckpts = map(str, Path(run_path).rglob("*.ckpt"))
+    ckpts = filter(lambda e: mode in e, ckpts)
+    ckpts = sorted(ckpts)
+    if len(ckpts): return ckpts[-1]
+    else: return None
+
+
+def get_beta_kl(step, warmup, min_beta, max_beta):
+    if step > warmup: return max_beta
+    t = step / warmup
+    min_beta_log = np.log(min_beta)
+    max_beta_log = np.log(max_beta)
+    beta_log = t * (max_beta_log - min_beta_log) + min_beta_log
+    return np.exp(beta_log)
+
+
+def get_beta_kl_cyclic(step, cycle_size, min_beta, max_beta):
+    return get_beta_kl(step % cycle_size, cycle_size // 2, min_beta, max_beta)
+
+
+def get_beta_kl_cyclic_annealed(step, cycle_size, warmup, min_beta, max_beta):
+    min_beta = get_beta_kl(step, warmup, min_beta, max_beta)
+    return get_beta_kl_cyclic(step, cycle_size, min_beta, max_beta)

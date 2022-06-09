@@ -2,6 +2,8 @@ import torch
 from torch.utils.data import random_split, DataLoader
 import pytorch_lightning as pl
 
+from rave.core import search_for_run
+
 from prior.model import Model
 from effortless_config import Config
 from os import environ, path
@@ -30,6 +32,8 @@ class args(Config):
 
     BATCH = 8
     CKPT = None
+    MAX_STEPS = 10000000
+    VAL_EVERY = 10000
 
     NAME = None
 
@@ -66,10 +70,10 @@ dataset = SimpleDataset(
     args.WAV,
     preprocess_function=simple_audio_preprocess(model.sr, args.N_SIGNAL),
     split_set="full",
-    transforms=lambda x: x.reshape(1, -1),
+    transforms=lambda x: x.reshape(1, -1).astype(np.float32),
 )
 
-val = (2 * len(dataset)) // 100
+val = max((2 * len(dataset)) // 100, 1)
 train = len(dataset) - val
 train, val = random_split(dataset, [train, val])
 
@@ -84,7 +88,11 @@ validation_checkpoint = pl.callbacks.ModelCheckpoint(
 last_checkpoint = pl.callbacks.ModelCheckpoint(filename="last")
 
 CUDA = gpu.getAvailable(maxMemory=.05)
-if len(CUDA):
+VISIBLE_DEVICES = environ.get("CUDA_VISIBLE_DEVICES", "")
+
+if VISIBLE_DEVICES:
+    use_gpu = int(int(VISIBLE_DEVICES) >= 0)
+elif len(CUDA):
     environ["CUDA_VISIBLE_DEVICES"] = str(CUDA[0])
     use_gpu = 1
 elif torch.cuda.is_available():
@@ -96,10 +104,10 @@ else:
     use_gpu = 0
 
 val_check = {}
-if len(train) >= 10000:
-    val_check["val_check_interval"] = 10000
+if len(train) >= args.VAL_EVERY:
+    val_check["val_check_interval"] = args.VAL_EVERY
 else:
-    nepoch = 10000 // len(train)
+    nepoch = args.VAL_EVERY // len(train)
     val_check["check_val_every_n_epoch"] = nepoch
 
 trainer = pl.Trainer(
@@ -107,8 +115,14 @@ trainer = pl.Trainer(
                                         name="prior"),
     gpus=use_gpu,
     callbacks=[validation_checkpoint, last_checkpoint],
-    resume_from_checkpoint=args.CKPT,
     max_epochs=100000,
+    max_steps=args.MAX_STEPS,
     **val_check,
 )
-trainer.fit(model, train, val)
+
+run = search_for_run(args.CKPT)
+if run is not None:
+    step = torch.load(run, map_location='cpu')["global_step"]
+    trainer.fit_loop.epoch_loop._batches_that_stepped = step
+
+trainer.fit(model, train, val, ckpt_path=run)

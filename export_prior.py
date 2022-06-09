@@ -3,14 +3,12 @@ import torch
 torch.set_grad_enabled(False)
 import torch.nn as nn
 from effortless_config import Config
-from glob import glob
-from os import path
 import logging
 from termcolor import colored
 
 import math
 
-from cached_conv import use_buffer_conv
+from cached_conv import use_cached_conv
 
 logging.basicConfig(level=logging.INFO,
                     format=colored("[%(relativeCreated).2f] ", "green") +
@@ -25,9 +23,9 @@ class args(Config):
 
 
 args.parse_args()
-use_buffer_conv(True)
+use_cached_conv(True)
 
-from cached_conv import *
+import cached_conv as cc
 from prior.model import Model
 from rave.core import search_for_run
 
@@ -57,7 +55,7 @@ class TraceModel(nn.Module):
                 torch.zeros(1, data_size, 1)),
         )
 
-        self.pre_diag_cache = CachedPadding1d(data_size - 1)
+        self.pre_diag_cache = cc.CachedPadding1d(data_size - 1)
         self.pre_diag_cache(z)
         self.pre_diag_cache = torch.jit.script(self.pre_diag_cache)
 
@@ -95,6 +93,7 @@ logging.info("loading model from checkpoint")
 
 RUN = search_for_run(args.RUN)
 logging.info(f"using {RUN}")
+
 model = Model.load_from_checkpoint(RUN, strict=False).eval()
 
 logging.info("warmup forward pass")
@@ -105,20 +104,6 @@ x = torch.zeros_like(x)
 x = model.quantized_normal.encode(model.diagonal_shift(x))
 x = x[..., -1:]
 model(x)
-
-logging.info("scripting cached modules")
-n_cache = 0
-
-cached_modules = [
-    CachedConv1d,
-]
-
-for n, m in model.named_modules():
-    if any(list(map(lambda c: isinstance(m, c), cached_modules))):
-        m.script_cache()
-        n_cache += 1
-
-logging.info(f"{n_cache} cached modules found and scripted")
 
 logging.info("script model")
 model = TraceModel(model)

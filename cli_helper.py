@@ -1,6 +1,5 @@
-import shutil
-import math
 from os import path
+import shutil
 
 
 class Print:
@@ -53,11 +52,21 @@ if __name__ == "__main__":
     sampling_rate = input("sampling rate (defaults to 48000): ")
     multiband_number = input("multiband number (defaults to 16): ")
     n_signal = input("training example duration (defaults to 65536 samples): ")
-    capacity = input("model capacity (defaults to 6): ")
-    warmup = input("number of steps for stage 1 (defaults to 1000000): ")
+
+    configurations = ["default", "small", "large"]
+    configuration = ""
+    while not configuration:
+        conf = input("configuration (default, small, large): ")
+        if conf in configurations:
+            configuration = conf
+        else:
+            print(f"configuration {conf} not understood.")
+
     prior_resolution = input("prior resolution (defaults to 32): ")
     fidelity = input("reconstruction fidelity (defaults to 0.95): ")
     no_latency = input("latency compensation (defaults to false): ")
+    latent_size = input("latent size (learned if left blank): ")
+    pressure = input("regularization strength (defaults to 0.1): ")
 
     header(f"{name}: training instructions")
     subsection("train rave")
@@ -66,6 +75,7 @@ if __name__ == "__main__":
     p("")
 
     cmd = "python train_rave.py "
+    cmd += f"-c {configuration} "
     cmd += f"--name {name} "
     cmd += f"--wav {data} "
     prep_rave = path.join(preprocessed, name, "rave")
@@ -77,12 +87,12 @@ if __name__ == "__main__":
         cmd += f"--data-size {multiband_number} "
     if n_signal:
         cmd += f"--n-signal {n_signal} "
-    if capacity:
-        cmd += f"--capacity {2**int(capacity)} "
-    if warmup:
-        cmd += f"--warmup {warmup} "
     if no_latency:
         cmd += f"--no-latency {no_latency.lower()} "
+    if latent_size:
+        cmd += f"--cropped-latent-size {int(latent_size)} "
+    if pressure:
+        cmd += f"--max-kl {pressure} "
 
     p(cmd)
     p("")
